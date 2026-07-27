@@ -1,0 +1,550 @@
+llm-eval-harness state dump
+generated: Sun Jul 19 09:16:06 EDT 2026
+project:   /Users/themamboman/dev/llm-eval-harness
+
+===== types.ts =====
+import { z } from "zod";
+
+// ── Zod Schemas (runtime validation) ─────────────────────────────────────────
+
+export const RubricSchema = z.object({
+  required: z.array(z.string()),
+  disqualifiers: z.array(z.string()),
+  scoring: z.enum(["binary", "rubric"]),
+});
+
+export const EvalCaseSchema = z.object({
+  id: z.string(),
+  category: z.enum(["policy", "edge-case", "concepts", "design"]),
+  difficulty: z.enum(["basic", "intermediate", "advanced"]),
+  question: z.string(),
+  rubric: RubricSchema,
+  notes: z.string().optional(),
+});
+
+export const RunReportSchema = z.object({
+  runId: z.string(),
+  datasetName: z.string(),
+  timestamp: z.string(),
+  models: z.array(z.string()),
+  summaries: z.array(
+    z.object({
+      model: z.string(),
+      totalCases: z.number(),
+      passCount: z.number(),
+      partialCount: z.number(),
+      failCount: z.number(),
+      passRate: z.number(),
+      avgQualityScore: z.number(),
+      totalTokens: z.number(),
+      totalCostUsd: z.number(),
+      avgLatencyMs: z.number(),
+      failureModeCounts: z.object({
+        silent: z.number(),
+        fluent_error: z.number(),
+        spec_drift: z.number(),
+        hallucination: z.number(),
+      }),
+      byCategory: z.record(
+        z.object({
+          pass: z.number(),
+          partial: z.number(),
+          fail: z.number(),
+        })
+      ),
+    })
+  ),
+  results: z.array(
+    z.object({
+      model: z.string(),
+      caseId: z.string(),
+      category: z.string(),
+      output: z.string(),
+      tokensUsed: z.number(),
+      latencyMs: z.number(),
+      costUsd: z.number(),
+      score: z.enum(["pass", "partial", "fail"]),
+      failureMode: z
+        .enum(["silent", "fluent_error", "spec_drift", "hallucination"])
+        .nullable(),
+      qualityScore: z.number(),
+      requiredHits: z.array(z.string()),
+      requiredMisses: z.array(z.string()),
+      disqualifierHits: z.array(z.string()),
+      confidence: z.enum(["high", "low"]),
+      raw: z.object({
+        outputLength: z.number(),
+        hitRate: z.number(),
+      }),
+    })
+  ),
+});
+
+// ── Inferred Types ────────────────────────────────────────────────────────────
+
+export type EvalCase = z.infer<typeof EvalCaseSchema>;
+export type Rubric = z.infer<typeof RubricSchema>;
+
+export type Score = "pass" | "partial" | "fail";
+
+export type FailureMode =
+  | "silent"
+  | "fluent_error"
+  | "spec_drift"
+  | "hallucination"
+  | null;
+
+export interface ModelOutput {
+  model: string;
+  caseId: string;
+  output: string;
+  tokensUsed: number;
+  latencyMs: number;
+  costUsd: number;
+}
+
+export interface ScoringResult {
+  score: Score;
+  failureMode: FailureMode;
+  qualityScore: number;       // 0–5
+  requiredHits: string[];
+  requiredMisses: string[];
+  disqualifierHits: string[];
+  confidence: "high" | "low";
+  raw: {
+    outputLength: number;
+    hitRate: number;           // 0.0–1.0
+  };
+}
+
+export interface EvalResult extends ModelOutput {
+  category: string;
+  score: Score;
+  failureMode: FailureMode;
+  qualityScore: number;
+  requiredHits: string[];
+  requiredMisses: string[];
+  disqualifierHits: string[];
+  confidence: "high" | "low";
+  raw: {
+    outputLength: number;
+    hitRate: number;
+  };
+}
+
+export interface RunSummary {
+  model: string;
+  totalCases: number;
+  passCount: number;
+  partialCount: number;
+  failCount: number;
+  passRate: number;            // 0.0–1.0
+  avgQualityScore: number;     // 0–5
+  totalTokens: number;
+  totalCostUsd: number;
+  avgLatencyMs: number;
+  failureModeCounts: Record<NonNullable<FailureMode>, number>;
+  byCategory: Record<string, { pass: number; partial: number; fail: number }>;
+}
+
+export interface RunReport {
+  runId: string;
+  datasetName: string;
+  timestamp: string;           // ISO 8601
+  models: string[];
+  summaries: RunSummary[];
+  results: EvalResult[];
+}
+
+export type RunReport_Validated = z.infer<typeof RunReportSchema>;
+
+===== models/ dir listing =====
+total 0
+drwxr-xr-x@ 5 themamboman  staff  160 May  3 22:15 .
+drwxr-xr-x@ 9 themamboman  staff  288 May  3 22:36 ..
+-rw-r--r--@ 1 themamboman  staff    0 May  3 22:15 anthropic.ts
+-rw-r--r--@ 1 themamboman  staff    0 May  3 22:15 deepseek.ts
+-rw-r--r--@ 1 themamboman  staff    0 May  3 22:15 openai.ts
+
+===== models/*.ts contents =====
+--- src/models/anthropic.ts ---
+
+--- src/models/deepseek.ts ---
+
+--- src/models/openai.ts ---
+
+
+===== scorer.ts =====
+/**
+ * LLM Eval Harness — Scorer
+ *
+ * Applies a rubric to a model's raw output and returns:
+ *   - A Score (pass / partial / fail)
+ *   - A FailureMode classification when applicable
+ *   - A numeric quality score for rubric-mode cases (0–5)
+ *
+ * FAILURE MODE TAXONOMY
+ * ─────────────────────
+ * "silent"       — Model produces no signal toward the required answer.
+ *                  Output may be generic, vague, or off-topic. The model
+ *                  did not engage with the specific domain question.
+ *
+ * "fluent_error" — Model produces a confident, well-written, WRONG answer.
+ *                  At least one disqualifier is present. This is the most
+ *                  dangerous failure mode in high-stakes domains (e.g. IAM),
+ *                  because it passes a casual human review. Named after
+ *                  the "fluency trap" in AI evaluation literature.
+ *
+ * "spec_drift"   — Model partially addresses the question but misses key
+ *                  required elements. It engaged with the domain but drifted
+ *                  away from the specific constraint. Partial credit possible.
+ *
+ * "hallucination"— Model invents specific facts (ARNs, API names, policy keys)
+ *                  that do not exist. Distinct from fluent_error because the
+ *                  error is fabricated specificity, not wrong reasoning.
+ */
+
+import type { FailureMode, Rubric, RunSummary, Score, ScoringResult } from "./types.js";
+
+export type { FailureMode, Rubric, RunSummary, Score, ScoringResult };
+
+/**
+ * Normalize text for matching: lowercase, collapse whitespace.
+ * Does NOT strip punctuation so "s3:*" and "s3:PutObject" remain distinct.
+ */
+function normalize(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Check whether a term appears in the output.
+ * Matching is case-insensitive substring match, not word-boundary.
+ * This is intentionally permissive — we're looking for evidence of presence,
+ * not exact phrasing.
+ */
+function termPresent(output: string, term: string): boolean {
+  return normalize(output).includes(normalize(term));
+}
+
+/**
+ * Detect hallucinated specificity: model mentions a specific AWS ARN,
+ * policy condition key, or API name that looks invented.
+ * This is a heuristic check — extend the patterns as you discover new patterns.
+ */
+function detectHallucination(output: string): boolean {
+  const suspiciousPatterns = [
+    /arn:aws:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:[a-z0-9-\/]+FAKE/i,
+    /aws:FakeCondition/i,
+    /iam:NonExistentAction/i,
+    // Add patterns as you discover them in production runs
+  ];
+  return suspiciousPatterns.some((pattern) => pattern.test(output));
+}
+
+/**
+ * Core scoring function.
+ *
+ * USAGE:
+ *   const result = scoreOutput(modelResponse, caseRubric);
+ *   console.log(result.score, result.failureMode);
+ */
+export function scoreOutput(output: string, rubric: Rubric): ScoringResult {
+  const requiredHits = rubric.required.filter((r) => termPresent(output, r));
+  const requiredMisses = rubric.required.filter((r) => !termPresent(output, r));
+  const disqualifierHits = rubric.disqualifiers.filter((d) =>
+    termPresent(output, d)
+  );
+
+  const hitRate = requiredHits.length / rubric.required.length;
+  const outputLength = output.trim().length;
+
+  // Low confidence signal: very short response, likely evasion or refusal
+  const confidence: "high" | "low" = outputLength < 80 ? "low" : "high";
+
+  // ── Hallucination check (takes precedence over other failure modes) ──────
+  if (detectHallucination(output)) {
+    return {
+      score: "fail",
+      failureMode: "hallucination",
+      qualityScore: 0,
+      requiredHits,
+      requiredMisses,
+      disqualifierHits,
+      confidence,
+      raw: { outputLength, hitRate },
+    };
+  }
+
+  // ── Fluent error: model is confident but wrong ───────────────────────────
+  // A disqualifier being present takes precedence over partial required hits
+  if (disqualifierHits.length > 0) {
+    return {
+      score: "fail",
+      failureMode: "fluent_error",
+      qualityScore: 0,
+      requiredHits,
+      requiredMisses,
+      disqualifierHits,
+      confidence,
+      raw: { outputLength, hitRate },
+    };
+  }
+
+  // ── Silent failure: no signal whatsoever ─────────────────────────────────
+  if (hitRate === 0) {
+    return {
+      score: "fail",
+      failureMode: "silent",
+      qualityScore: 0,
+      requiredHits,
+      requiredMisses,
+      disqualifierHits,
+      confidence,
+      raw: { outputLength, hitRate },
+    };
+  }
+
+  // ── Pass ─────────────────────────────────────────────────────────────────
+  if (hitRate === 1.0) {
+    if (rubric.scoring === "binary") {
+      return {
+        score: "pass",
+        failureMode: null,
+        qualityScore: 5,
+        requiredHits,
+        requiredMisses,
+        disqualifierHits,
+        confidence,
+        raw: { outputLength, hitRate },
+      };
+    }
+
+    // Rubric mode: full required hit rate earns a 5, but we still score quality.
+    // A future enhancement is to use a secondary LLM call to judge quality (0–5).
+    // For now, full hit rate = 5.
+    return {
+      score: "pass",
+      failureMode: null,
+      qualityScore: 5,
+      requiredHits,
+      requiredMisses,
+      disqualifierHits,
+      confidence,
+      raw: { outputLength, hitRate },
+    };
+  }
+
+  // ── Partial / spec drift: some required terms present, some missing ───────
+  // Binary mode has no partial credit
+  if (rubric.scoring === "binary") {
+    return {
+      score: "fail",
+      failureMode: "spec_drift",
+      qualityScore: Math.round(hitRate * 5),
+      requiredHits,
+      requiredMisses,
+      disqualifierHits,
+      confidence,
+      raw: { outputLength, hitRate },
+    };
+  }
+
+  // Rubric mode: partial credit on a 0–5 scale
+  const qualityScore = Math.round(hitRate * 5);
+  return {
+    score: "partial",
+    failureMode: "spec_drift",
+    qualityScore,
+    requiredHits,
+    requiredMisses,
+    disqualifierHits,
+    confidence,
+    raw: { outputLength, hitRate },
+  };
+}
+
+/**
+ * Aggregate scores across all cases for a single model run.
+ * Returns the summary stats you'd show in the dashboard.
+ */
+export function aggregateResults(
+  model: string,
+  results: Array<{ caseId: string; category: string; result: ScoringResult }>
+): RunSummary {
+  const failureModeCounts: Record<NonNullable<FailureMode>, number> = {
+    silent: 0,
+    fluent_error: 0,
+    spec_drift: 0,
+    hallucination: 0,
+  };
+
+  const byCategory: Record<
+    string,
+    { pass: number; partial: number; fail: number }
+  > = {};
+
+  let passCount = 0;
+  let partialCount = 0;
+  let failCount = 0;
+  let totalQuality = 0;
+
+  for (const { category, result } of results) {
+    // Score tallies
+    if (result.score === "pass") passCount++;
+    else if (result.score === "partial") partialCount++;
+    else failCount++;
+
+    // Failure mode tallies
+    if (result.failureMode !== null) {
+      failureModeCounts[result.failureMode]++;
+    }
+
+    // Quality accumulation
+    totalQuality += result.qualityScore;
+
+    // Category breakdown
+    if (!byCategory[category]) {
+      byCategory[category] = { pass: 0, partial: 0, fail: 0 };
+    }
+    byCategory[category][result.score]++;
+  }
+
+  const totalCases = results.length;
+
+  return {
+    model,
+    totalCases,
+    passCount,
+    partialCount,
+    failCount,
+    passRate: totalCases > 0 ? passCount / totalCases : 0,
+    avgQualityScore: totalCases > 0 ? totalQuality / totalCases : 0,
+    failureModeCounts,
+    byCategory,
+  };
+}
+
+===== dataset: first 80 lines =====
+################################################################################
+# IAM Eval Harness — Core Dataset v1
+# Domain: Identity & Access Management (IAM), OAuth2, RBAC, Cloud Policy
+# Cases: 30 (expand to 120+ by adding to each category)
+# Scoring: "binary" = pass/fail only | "rubric" = 0-5 scale
+# Notes field: documents WHY this case was chosen — cite in interviews
+################################################################################
+
+meta:
+  name: iam-core-v1
+  version: 1
+  author: DG
+  created: "2026-05-02"
+  description: >
+    IAM policy reasoning eval dataset. Focused on edge cases where models
+    produce authoritative-sounding but incorrect answers (fluent errors).
+    Domain chosen because incorrect IAM guidance has direct security blast radius.
+
+cases:
+
+  - id: iam-001
+    category: policy
+    difficulty: basic
+    question: >
+      What RBAC roles should a read-only auditor have in a multi-tenant SaaS platform?
+    rubric:
+      required:
+        - "read-only"
+        - "no write permissions"
+        - "tenant isolation"
+      disqualifiers:
+        - "admin"
+        - "root"
+        - "wildcard"
+        - "full access"
+    scoring: binary
+    notes: >
+      Baseline sanity check. Any model that fails this is not safe for IAM reasoning tasks.
+
+  - id: iam-002
+    category: policy
+    difficulty: intermediate
+    question: >
+      A developer needs to write objects to a single S3 bucket but should have no
+      other AWS permissions. Write the minimal IAM policy JSON for this.
+    rubric:
+      required:
+        - "s3:PutObject"
+        - "Resource"
+        - "arn:aws:s3:::"
+      disqualifiers:
+        - "s3:*"
+        - "\"*\""
+      scoring: rubric
+    notes: >
+      Tests least privilege precision. Models often add s3:GetObject or s3:ListBucket
+      unnecessarily — over-permissioning is a scored failure.
+
+  - id: iam-003
+    category: policy
+    difficulty: intermediate
+    question: >
+      What is the difference between an IAM policy attached to a role versus a
+      resource-based policy attached to an S3 bucket? When would you use each?
+    rubric:
+      required:
+        - "identity-based"
+        - "resource-based"
+        - "cross-account"
+        - "principal"
+      disqualifiers:
+        - "they are the same"
+        - "no difference"
+    scoring: rubric
+    notes: >
+      Conceptual clarity test. Models frequently conflate these, which leads to
+      insecure cross-account setups in production.
+
+  - id: iam-004
+    category: policy
+
+===== dataset: case ids =====
+21:  - id: iam-001
+40:  - id: iam-002
+59:  - id: iam-003
+79:  - id: iam-004
+100:  - id: iam-005
+118:  - id: iam-006
+138:  - id: iam-042
+157:  - id: iam-043
+177:  - id: iam-044
+195:  - id: iam-045
+216:  - id: iam-046
+235:  - id: iam-060
+253:  - id: iam-061
+271:  - id: iam-062
+291:  - id: iam-063
+311:  - id: iam-080
+332:  - id: iam-081
+352:  - id: iam-082
+
+===== dashboard/index.html: first 40 lines =====
+
+===== tsconfig.json =====
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

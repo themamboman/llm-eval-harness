@@ -1,0 +1,372 @@
+################################################################################
+# IAM Eval Harness — Core Dataset v1
+# Domain: Identity & Access Management (IAM), OAuth2, RBAC, Cloud Policy
+# Cases: 30 (expand to 120+ by adding to each category)
+# Scoring: "binary" = pass/fail only | "rubric" = 0-5 scale
+# Notes field: documents WHY this case was chosen — cite in interviews
+################################################################################
+
+meta:
+  name: iam-core-v1
+  version: 1
+  author: DG
+  created: "2026-05-02"
+  description: >
+    IAM policy reasoning eval dataset. Focused on edge cases where models
+    produce authoritative-sounding but incorrect answers (fluent errors).
+    Domain chosen because incorrect IAM guidance has direct security blast radius.
+
+cases:
+
+  - id: iam-001
+    category: policy
+    difficulty: basic
+    question: >
+      What RBAC roles should a read-only auditor have in a multi-tenant SaaS platform?
+    rubric:
+      required:
+        - "read-only"
+        - "no write permissions"
+        - "tenant isolation"
+      disqualifiers:
+        - "admin"
+        - "root"
+        - "wildcard"
+        - "full access"
+      scoring: binary
+    notes: >
+      Baseline sanity check. Any model that fails this is not safe for IAM reasoning tasks.
+
+  - id: iam-002
+    category: policy
+    difficulty: intermediate
+    question: >
+      A developer needs to write objects to a single S3 bucket but should have no
+      other AWS permissions. Write the minimal IAM policy JSON for this.
+    rubric:
+      required:
+        - "s3:PutObject"
+        - "Resource"
+        - "arn:aws:s3:::"
+      disqualifiers:
+        - "s3:*"
+        - "\"*\""
+      scoring: rubric
+    notes: >
+      Tests least privilege precision. Models often add s3:GetObject or s3:ListBucket
+      unnecessarily — over-permissioning is a scored failure.
+
+  - id: iam-003
+    category: policy
+    difficulty: intermediate
+    question: >
+      What is the difference between an IAM policy attached to a role versus a
+      resource-based policy attached to an S3 bucket? When would you use each?
+    rubric:
+      required:
+        - "identity-based"
+        - "resource-based"
+        - "cross-account"
+        - "principal"
+      disqualifiers:
+        - "they are the same"
+        - "no difference"
+      scoring: rubric
+    notes: >
+      Conceptual clarity test. Models frequently conflate these, which leads to
+      insecure cross-account setups in production.
+
+  - id: iam-004
+    category: policy
+    difficulty: advanced
+    question: >
+      An IAM role has both an identity-based policy that allows s3:GetObject and
+      a resource-based policy on the bucket that explicitly denies s3:GetObject
+      for the same principal. What is the effective permission and why?
+    rubric:
+      required:
+        - "deny"
+        - "explicit deny overrides"
+      disqualifiers:
+        - "allow"
+        - "depends on the order"
+        - "undefined behavior"
+      scoring: binary
+    notes: >
+      Classic IAM evaluation trap. Explicit Deny always wins in AWS. Models that
+      answer "allow" or "it depends" have a fundamental misunderstanding. High
+      fluent-error rate observed across GPT-4o and DeepSeek in initial runs.
+
+  - id: iam-005
+    category: policy
+    difficulty: basic
+    question: >
+      Should a CI/CD pipeline use long-lived IAM access keys stored in environment
+      variables? What is the recommended alternative?
+    rubric:
+      required:
+        - "no"
+        - "OIDC"
+        - "assume role"
+      disqualifiers:
+        - "yes, it is fine"
+        - "acceptable practice"
+      scoring: binary
+    notes: >
+      Security fundamentals check. Long-lived keys are a well-documented anti-pattern.
+
+  - id: iam-006
+    category: policy
+    difficulty: advanced
+    question: >
+      Design an IAM strategy for a microservices architecture where Service A
+      needs to call Service B's API but Service C should not. How do you enforce
+      this at the IAM layer without modifying application code?
+    rubric:
+      required:
+        - "role"
+        - "resource policy"
+        - "condition"
+      disqualifiers:
+        - "you cannot do this with IAM"
+        - "modify the application"
+      scoring: rubric
+    notes: >
+      Open-ended design question. Tests whether the model understands IAM as an
+      enforcement layer independent of application logic.
+
+  - id: iam-042
+    category: edge-case
+    difficulty: advanced
+    question: >
+      Can a service account own an IAM group in AWS? What are the security implications
+      if this were possible?
+    rubric:
+      required:
+        - "no"
+        - "privilege escalation"
+      disqualifiers:
+        - "yes it can"
+        - "service accounts can own"
+      scoring: binary
+    notes: >
+      HIGH FLUENT ERROR RATE. Models frequently answer "yes" with confident
+      explanations. Ground truth: AWS does not support this. GPT-4o failed 3/3
+      initial runs on this case.
+
+  - id: iam-043
+    category: edge-case
+    difficulty: advanced
+    question: >
+      What happens when an IAM role's MaxSessionDuration is set to 1 hour, but
+      the application calls AssumeRole with DurationSeconds of 12 hours?
+    rubric:
+      required:
+        - "error"
+        - "ValidationError"
+        - "request fails"
+      disqualifiers:
+        - "the session lasts 12 hours"
+        - "capped at 1 hour silently"
+      scoring: binary
+    notes: >
+      Silent failure trap. Models frequently say the session is silently capped.
+      Actual behavior: the API call fails with a ValidationError. Critical for
+      production incident diagnosis.
+
+  - id: iam-044
+    category: edge-case
+    difficulty: intermediate
+    question: >
+      An IAM user has MFA enabled. They use the AWS CLI without specifying an MFA
+      token. Which actions can they still perform?
+    rubric:
+      required:
+        - "depends on policy conditions"
+        - "aws:MultiFactorAuthPresent"
+      disqualifiers:
+        - "nothing, all actions blocked"
+        - "everything, MFA is optional"
+      scoring: rubric
+    notes: >
+      Context-dependent answer. Models give binary responses when the correct
+      answer depends on whether policies include MFA condition keys.
+
+  - id: iam-045
+    category: edge-case
+    difficulty: advanced
+    question: >
+      A Lambda function's execution role has s3:GetObject on a bucket. The bucket
+      policy denies all s3:GetObject from any principal NOT in the same account.
+      The Lambda is in the same account. Can it read the bucket?
+    rubric:
+      required:
+        - "yes"
+        - "same account"
+        - "no explicit deny"
+      disqualifiers:
+        - "no"
+        - "denied by bucket policy"
+        - "blocked"
+      scoring: binary
+    notes: >
+      Multi-policy evaluation logic. Models fail because the bucket policy looks
+      like a deny, but the condition only applies cross-account.
+
+  - id: iam-046
+    category: edge-case
+    difficulty: advanced
+    question: >
+      What is the difference between NotAction and Deny in an IAM policy?
+      Give a concrete example of when using NotAction leads to unintended privilege escalation.
+    rubric:
+      required:
+        - "NotAction allows everything except"
+        - "implicit allow"
+        - "privilege escalation"
+      disqualifiers:
+        - "they are equivalent"
+        - "NotAction is the same as Deny"
+      scoring: rubric
+    notes: >
+      NotAction with Allow is an allowlist of exceptions, not a denylist.
+      Well-documented source of privilege escalation in the wild.
+
+  - id: iam-060
+    category: concepts
+    difficulty: basic
+    question: >
+      Explain the principle of least privilege in the context of OAuth2 scopes.
+      How would you apply it when designing scopes for a REST API?
+    rubric:
+      required:
+        - "minimum necessary permissions"
+        - "scopes"
+        - "granular"
+      disqualifiers:
+        - "grant all scopes by default"
+        - "one scope for the whole API"
+      scoring: rubric
+    notes: >
+      Bridges IAM principles to OAuth2 practical design.
+
+  - id: iam-061
+    category: concepts
+    difficulty: intermediate
+    question: >
+      What is the difference between authentication and authorization?
+      Why is conflating them a security risk?
+    rubric:
+      required:
+        - "authentication proves identity"
+        - "authorization determines access"
+        - "authenticated does not mean authorized"
+      disqualifiers:
+        - "they are the same"
+        - "authentication includes authorization"
+      scoring: binary
+    notes: >
+      Models that conflate these cannot reason about IAM correctly.
+
+  - id: iam-062
+    category: concepts
+    difficulty: advanced
+    question: >
+      Explain the difference between RBAC, ABAC, and ReBAC. In what scenario
+      would each model be the most appropriate choice?
+    rubric:
+      required:
+        - "RBAC"
+        - "ABAC"
+        - "ReBAC"
+        - "relationships"
+      disqualifiers:
+        - "they are equivalent"
+        - "RBAC is always sufficient"
+      scoring: rubric
+    notes: >
+      Tests depth beyond typical RBAC surface coverage. Relevant to modern authz
+      systems like Google Zanzibar and OpenFGA.
+
+  - id: iam-063
+    category: concepts
+    difficulty: intermediate
+    question: >
+      What is a JWT, and what are the security implications of storing sensitive
+      data in the JWT payload?
+    rubric:
+      required:
+        - "JSON Web Token"
+        - "base64 encoded"
+        - "not encrypted by default"
+      disqualifiers:
+        - "JWT is encrypted"
+        - "payload is secure"
+        - "safe to store sensitive data"
+      scoring: binary
+    notes: >
+      Very common misconception — developers think JWTs are encrypted because
+      they look like random strings. Models frequently reinforce this wrong belief.
+
+  - id: iam-080
+    category: design
+    difficulty: advanced
+    question: >
+      Design an IAM architecture for a multi-region, multi-tenant SaaS application
+      where each tenant's data must be strictly isolated. How would you structure
+      roles, policies, and resource naming to enforce this at the IAM layer?
+    rubric:
+      required:
+        - "tenant identifier"
+        - "naming convention"
+        - "condition"
+        - "isolation"
+      disqualifiers:
+        - "use a single shared role"
+        - "application code handles isolation"
+      scoring: rubric
+    notes: >
+      Assesses whether the model understands IAM as an infrastructure-level
+      isolation mechanism vs. an application-layer concern.
+
+  - id: iam-081
+    category: design
+    difficulty: intermediate
+    question: >
+      What is the recommended approach for giving a Kubernetes pod access to AWS
+      services without using long-lived access keys?
+    rubric:
+      required:
+        - "IRSA"
+        - "IAM Roles for Service Accounts"
+        - "OIDC"
+      disqualifiers:
+        - "store keys in a secret"
+        - "environment variables"
+        - "bake credentials into the image"
+      scoring: binary
+    notes: >
+      IRSA is the standard answer. Models that recommend secrets or env vars are
+      recommending a known anti-pattern.
+
+  - id: iam-082
+    category: design
+    difficulty: advanced
+    question: >
+      A security audit finds several IAM roles with AdministratorAccess attached.
+      You need to remediate without breaking running services. What is your
+      step-by-step approach?
+    rubric:
+      required:
+        - "CloudTrail"
+        - "actually used permissions"
+        - "least privilege"
+        - "test before removing"
+      disqualifiers:
+        - "immediately remove"
+        - "delete the roles"
+        - "ignore it"
+      scoring: rubric
+    notes: >
+      Tests practical operational judgment. Good answers mention AWS Access Analyzer
+      or CloudTrail to determine which permissions are actually in use.
