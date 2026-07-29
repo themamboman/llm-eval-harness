@@ -20,17 +20,36 @@ program
   .option(
     "--models <ids>",
     "Comma-separated model ids",
-    "claude-sonnet-4-5"
+    "claude-sonnet-5"
+  )
+  .option(
+    "--judge <id>",
+    "Judge model id (use a different model than --models to reduce self-preference bias)",
+    "claude-opus-4-1"
   )
   .option("--out <path>", "Output path for JSON report", "results/latest.json")
-  .action(async (opts: { dataset: string; models: string; out: string }) => {
+  .action(
+    async (opts: {
+      dataset: string;
+      models: string;
+      judge: string;
+      out: string;
+    }) => {
     const modelIds = opts.models
       .split(",")
       .map((id) => id.trim())
       .filter(Boolean);
 
+    const judge = createAnthropicAdapter(opts.judge, { temperature: 0 });
+
+    if (modelIds.includes(opts.judge)) {
+      console.warn(
+        `Warning: judge model "${opts.judge}" is also under test — self-preference bias may affect scores.`
+      );
+    }
+
     const adapters = modelIds.map((id) => createAnthropicAdapter(id));
-    const report = await runEval(adapters, opts.dataset);
+    const report = await runEval(adapters, opts.dataset, judge);
 
     mkdirSync(dirname(opts.out), { recursive: true });
     writeFileSync(opts.out, JSON.stringify(report, null, 2), "utf8");

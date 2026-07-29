@@ -65,15 +65,18 @@ export function buildPrompt(evalCase: EvalCase): string {
  */
 export async function runModel(
   adapter: ModelAdapter,
-  cases: EvalCase[]
+  cases: EvalCase[],
+  judge?: ModelAdapter
 ): Promise<EvalResult[]> {
   const results: EvalResult[] = [];
 
   for (const evalCase of cases) {
+    console.log(`→ ${adapter.name} :: ${evalCase.id}`);
     const completion = await adapter.complete(buildPrompt(evalCase));
-    const scoring: ScoringResult = scoreOutput(
+    const scoring: ScoringResult = await scoreOutput(
       completion.output,
-      evalCase.rubric
+      evalCase.rubric,
+      judge
     );
 
     results.push({
@@ -163,7 +166,8 @@ function summarize(model: string, results: EvalResult[]): RunSummary {
  */
 export async function runEval(
   adapters: ModelAdapter[],
-  datasetPath: string
+  datasetPath: string,
+  judge?: ModelAdapter
 ): Promise<RunReport> {
   const { meta, cases } = loadDataset(datasetPath);
 
@@ -171,7 +175,7 @@ export async function runEval(
   const summaries: RunSummary[] = [];
 
   for (const adapter of adapters) {
-    const modelResults = await runModel(adapter, cases);
+    const modelResults = await runModel(adapter, cases, judge);
     results.push(...modelResults);
     summaries.push(summarize(adapter.name, modelResults));
   }
