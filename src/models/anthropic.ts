@@ -1,17 +1,24 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { CompletionResult, ModelAdapter } from "../types.js";
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const client = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  timeout: 30000,
+  maxRetries: 0,
+});
 
 // USD per 1,000,000 tokens. These are placeholders — verify against current
 // Anthropic pricing before trusting the cost column.
 const PRICING: Record<string, { input: number; output: number }> = {
-  "claude-sonnet-4-5": { input: 3, output: 15 },
+  "claude-sonnet-5": { input: 3, output: 15 },
   "claude-opus-4-1": { input: 15, output: 75 },
   "claude-haiku-3-5": { input: 0.8, output: 4 },
 };
 
-export function createAnthropicAdapter(model: string): ModelAdapter {
+export function createAnthropicAdapter(
+  model: string,
+  options?: { temperature?: number }
+): ModelAdapter {
   return {
     name: model,
     async complete(prompt: string): Promise<CompletionResult> {
@@ -20,6 +27,9 @@ export function createAnthropicAdapter(model: string): ModelAdapter {
       const resp = await client.messages.create({
         model,
         max_tokens: 1024,
+        ...(options?.temperature !== undefined
+          ? { temperature: options.temperature }
+          : {}),
         messages: [{ role: "user", content: prompt }],
       });
 

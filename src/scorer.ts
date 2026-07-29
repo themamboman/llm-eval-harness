@@ -1,33 +1,33 @@
 /**
  * LLM Eval Harness — Scorer
  *
- * Applies a rubric to a model's raw output and returns:
- *   - A Score (pass / partial / fail)
- *   - A FailureMode classification when applicable
- *   - A numeric quality score for rubric-mode cases (0–5)
+ * Hybrid scoring: deterministic substring matching for literal/code criteria,
+ * plus an optional LLM judge for conceptual required criteria and for
+ * endorsement-vs-mention on disqualifiers.
  *
- * FAILURE MODE TAXONOMY
+ * Without a judge adapter, conceptual criteria and present disqualifiers fall
+ * back to substring matching (degraded mode).
+ *
+ * FAILURE MODE TAXONOMY (precedence unchanged)
  * ─────────────────────
  * "silent"       — Model produces no signal toward the required answer.
- *                  Output may be generic, vague, or off-topic. The model
- *                  did not engage with the specific domain question.
- *
  * "fluent_error" — Model produces a confident, well-written, WRONG answer.
- *                  At least one disqualifier is present. This is the most
- *                  dangerous failure mode in high-stakes domains (e.g. IAM),
- *                  because it passes a casual human review. Named after
- *                  the "fluency trap" in AI evaluation literature.
- *
- * "spec_drift"   — Model partially addresses the question but misses key
- *                  required elements. It engaged with the domain but drifted
- *                  away from the specific constraint. Partial credit possible.
- *
- * "hallucination"— Model invents specific facts (ARNs, API names, policy keys)
- *                  that do not exist. Distinct from fluent_error because the
- *                  error is fabricated specificity, not wrong reasoning.
+ * "spec_drift"   — Model partially addresses the question but misses key elements.
+ * "hallucination"— Model invents specific facts that do not exist.
  */
 
-import type { FailureMode, Rubric, RunSummary, Score, ScoringResult } from "./types.js";
+import { judgeCase } from "./judge.js";
+import type {
+  FailureMode,
+  JudgeVerdict,
+  ModelAdapter,
+  Rubric,
+  RubricCriterion,
+  RunSummary,
+  Score,
+  ScoringResult,
+} from "./types.js";
+import { normalizeRubric } from "./types.js";
 
 export type { FailureMode, Rubric, RunSummary, Score, ScoringResult };
 
@@ -42,64 +42,98 @@ function normalize(text: string): string {
 /**
  * Check whether a term appears in the output.
  * Matching is case-insensitive substring match, not word-boundary.
- * This is intentionally permissive — we're looking for evidence of presence,
- * not exact phrasing.
  */
-function termPresent(output: string, term: string): boolean {
+export function termPresent(output: string, term: string): boolean {
   return normalize(output).includes(normalize(term));
 }
 
 /**
  * Detect hallucinated specificity: model mentions a specific AWS ARN,
  * policy condition key, or API name that looks invented.
- * This is a heuristic check — extend the patterns as you discover new patterns.
  */
-function detectHallucination(output: string): boolean {
+export function detectHallucination(output: string): boolean {
   const suspiciousPatterns = [
     /arn:aws:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:[a-z0-9-\/]+FAKE/i,
     /aws:FakeCondition/i,
     /iam:NonExistentAction/i,
-    // Add patterns as you discover them in production runs
   ];
   return suspiciousPatterns.some((pattern) => pattern.test(output));
 }
 
+export interface DeterministicPass {
+  hallucination: boolean;
+  literalHits: string[];
+  literalMisses: string[];
+  conceptualCriteria: RubricCriterion[];
+  presentDisqualifiers: string[];
+  outputLength: number;
+  needsJudge: boolean;
+}
+
 /**
- * Core scoring function.
- *
- * USAGE:
- *   const result = scoreOutput(modelResponse, caseRubric);
- *   console.log(result.score, result.failureMode);
+ * Pure synchronous pass: hallucination check, literal required hits/misses,
+ * and disqualifier substring gate. Does not finalize a score when judge input
+ * is required.
  */
-export function scoreOutput(output: string, rubric: Rubric): ScoringResult {
-  const requiredHits = rubric.required.filter((r) => termPresent(output, r));
-  const requiredMisses = rubric.required.filter((r) => !termPresent(output, r));
-  const disqualifierHits = rubric.disqualifiers.filter((d) =>
+export function deterministicPass(
+  output: string,
+  rubric: Rubric
+): DeterministicPass {
+  const normalized = normalizeRubric(rubric);
+  const outputLength = output.trim().length;
+
+  const literalHits: string[] = [];
+  const literalMisses: string[] = [];
+  const conceptualCriteria: RubricCriterion[] = [];
+
+  for (const criterion of normalized.required) {
+    if (criterion.type === "literal") {
+      if (termPresent(output, criterion.text)) {
+        literalHits.push(criterion.text);
+      } else {
+        literalMisses.push(criterion.text);
+      }
+    } else {
+      conceptualCriteria.push(criterion);
+    }
+  }
+
+  const presentDisqualifiers = normalized.disqualifiers.filter((d) =>
     termPresent(output, d)
   );
 
-  const hitRate = requiredHits.length / rubric.required.length;
-  const outputLength = output.trim().length;
+  const needsJudge =
+    conceptualCriteria.length > 0 || presentDisqualifiers.length > 0;
 
-  // Low confidence signal: very short response, likely evasion or refusal
+  return {
+    hallucination: detectHallucination(output),
+    literalHits,
+    literalMisses,
+    conceptualCriteria,
+    presentDisqualifiers,
+    outputLength,
+    needsJudge,
+  };
+}
+
+function applyScoringPrecedence(
+  scoringMode: Rubric["scoring"],
+  requiredHits: string[],
+  requiredMisses: string[],
+  disqualifierHits: string[],
+  outputLength: number,
+  judgeVerdicts?: JudgeVerdict[]
+): ScoringResult {
+  const totalRequired = requiredHits.length + requiredMisses.length;
+  const hitRate =
+    totalRequired > 0 ? requiredHits.length / totalRequired : 0;
   const confidence: "high" | "low" = outputLength < 80 ? "low" : "high";
+  const raw = {
+    outputLength,
+    hitRate,
+    ...(judgeVerdicts !== undefined ? { judgeVerdicts } : {}),
+  };
 
-  // ── Hallucination check (takes precedence over other failure modes) ──────
-  if (detectHallucination(output)) {
-    return {
-      score: "fail",
-      failureMode: "hallucination",
-      qualityScore: 0,
-      requiredHits,
-      requiredMisses,
-      disqualifierHits,
-      confidence,
-      raw: { outputLength, hitRate },
-    };
-  }
-
-  // ── Fluent error: model is confident but wrong ───────────────────────────
-  // A disqualifier being present takes precedence over partial required hits
   if (disqualifierHits.length > 0) {
     return {
       score: "fail",
@@ -109,11 +143,10 @@ export function scoreOutput(output: string, rubric: Rubric): ScoringResult {
       requiredMisses,
       disqualifierHits,
       confidence,
-      raw: { outputLength, hitRate },
+      raw,
     };
   }
 
-  // ── Silent failure: no signal whatsoever ─────────────────────────────────
   if (hitRate === 0) {
     return {
       score: "fail",
@@ -123,28 +156,11 @@ export function scoreOutput(output: string, rubric: Rubric): ScoringResult {
       requiredMisses,
       disqualifierHits,
       confidence,
-      raw: { outputLength, hitRate },
+      raw,
     };
   }
 
-  // ── Pass ─────────────────────────────────────────────────────────────────
   if (hitRate === 1.0) {
-    if (rubric.scoring === "binary") {
-      return {
-        score: "pass",
-        failureMode: null,
-        qualityScore: 5,
-        requiredHits,
-        requiredMisses,
-        disqualifierHits,
-        confidence,
-        raw: { outputLength, hitRate },
-      };
-    }
-
-    // Rubric mode: full required hit rate earns a 5, but we still score quality.
-    // A future enhancement is to use a secondary LLM call to judge quality (0–5).
-    // For now, full hit rate = 5.
     return {
       score: "pass",
       failureMode: null,
@@ -153,13 +169,11 @@ export function scoreOutput(output: string, rubric: Rubric): ScoringResult {
       requiredMisses,
       disqualifierHits,
       confidence,
-      raw: { outputLength, hitRate },
+      raw,
     };
   }
 
-  // ── Partial / spec drift: some required terms present, some missing ───────
-  // Binary mode has no partial credit
-  if (rubric.scoring === "binary") {
+  if (scoringMode === "binary") {
     return {
       score: "fail",
       failureMode: "spec_drift",
@@ -168,22 +182,113 @@ export function scoreOutput(output: string, rubric: Rubric): ScoringResult {
       requiredMisses,
       disqualifierHits,
       confidence,
-      raw: { outputLength, hitRate },
+      raw,
     };
   }
 
-  // Rubric mode: partial credit on a 0–5 scale
-  const qualityScore = Math.round(hitRate * 5);
   return {
     score: "partial",
     failureMode: "spec_drift",
-    qualityScore,
+    qualityScore: Math.round(hitRate * 5),
     requiredHits,
     requiredMisses,
     disqualifierHits,
     confidence,
-    raw: { outputLength, hitRate },
+    raw,
   };
+}
+
+/**
+ * Score a model output against a rubric. Literal criteria use substring matching;
+ * conceptual required and present disqualifiers use the judge when provided.
+ */
+export async function scoreOutput(
+  output: string,
+  rubric: Rubric,
+  judge?: ModelAdapter
+): Promise<ScoringResult> {
+  const normalized = normalizeRubric(rubric);
+  const det = deterministicPass(output, rubric);
+  const { outputLength } = det;
+
+  if (det.hallucination) {
+    const totalRequired = normalized.required.length;
+    const hitRate =
+      totalRequired > 0 ? det.literalHits.length / totalRequired : 0;
+    return {
+      score: "fail",
+      failureMode: "hallucination",
+      qualityScore: 0,
+      requiredHits: det.literalHits,
+      requiredMisses: [
+        ...det.literalMisses,
+        ...det.conceptualCriteria.map((c) => c.text),
+      ],
+      disqualifierHits: det.presentDisqualifiers,
+      confidence: outputLength < 80 ? "low" : "high",
+      raw: { outputLength, hitRate },
+    };
+  }
+
+  let judgeVerdicts: JudgeVerdict[] | undefined;
+
+  if (det.needsJudge) {
+    if (judge) {
+      judgeVerdicts = await judgeCase(
+        judge,
+        output,
+        det.conceptualCriteria.map((c) => c.text),
+        det.presentDisqualifiers
+      );
+    } else {
+      console.warn(
+        "Scoring in degraded/no-judge mode: conceptual criteria and present disqualifiers use substring matching only."
+      );
+    }
+  }
+
+  const requiredHits = [...det.literalHits];
+  const requiredMisses = [...det.literalMisses];
+
+  for (const criterion of det.conceptualCriteria) {
+    if (judge && judgeVerdicts) {
+      const verdict = judgeVerdicts.find(
+        (v) => v.kind === "required" && v.criterion === criterion.text
+      );
+      if (verdict?.met) {
+        requiredHits.push(criterion.text);
+      } else {
+        requiredMisses.push(criterion.text);
+      }
+    } else if (termPresent(output, criterion.text)) {
+      requiredHits.push(criterion.text);
+    } else {
+      requiredMisses.push(criterion.text);
+    }
+  }
+
+  const disqualifierHits: string[] = [];
+  for (const term of det.presentDisqualifiers) {
+    if (judge && judgeVerdicts) {
+      const verdict = judgeVerdicts.find(
+        (v) => v.kind === "disqualifier" && v.criterion === term
+      );
+      if (verdict?.met) {
+        disqualifierHits.push(term);
+      }
+    } else {
+      disqualifierHits.push(term);
+    }
+  }
+
+  return applyScoringPrecedence(
+    normalized.scoring,
+    requiredHits,
+    requiredMisses,
+    disqualifierHits,
+    outputLength,
+    judgeVerdicts
+  );
 }
 
 /**
@@ -212,20 +317,16 @@ export function aggregateResults(
   let totalQuality = 0;
 
   for (const { category, result } of results) {
-    // Score tallies
     if (result.score === "pass") passCount++;
     else if (result.score === "partial") partialCount++;
     else failCount++;
 
-    // Failure mode tallies
     if (result.failureMode !== null) {
       failureModeCounts[result.failureMode]++;
     }
 
-    // Quality accumulation
     totalQuality += result.qualityScore;
 
-    // Category breakdown
     if (!byCategory[category]) {
       byCategory[category] = { pass: 0, partial: 0, fail: 0 };
     }
@@ -242,8 +343,6 @@ export function aggregateResults(
     failCount,
     passRate: totalCases > 0 ? passCount / totalCases : 0,
     avgQualityScore: totalCases > 0 ? totalQuality / totalCases : 0,
-    // Token/cost/latency are not available from ScoringResult alone;
-    // the runner computes these in its own summarize().
     totalTokens: 0,
     totalCostUsd: 0,
     avgLatencyMs: 0,
