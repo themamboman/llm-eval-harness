@@ -2,10 +2,31 @@ import { z } from "zod";
 
 // ── Zod Schemas (runtime validation) ─────────────────────────────────────────
 
+export const RubricCriterionItemSchema = z.union([
+  z.string(),
+  z.object({
+    text: z.string(),
+    type: z.enum(["literal", "conceptual"]).optional(),
+  }),
+]);
+
 export const RubricSchema = z.object({
-  required: z.array(z.string()),
-  disqualifiers: z.array(z.string()),
+  required: z.array(RubricCriterionItemSchema),
+  disqualifiers: z.array(RubricCriterionItemSchema),
   scoring: z.enum(["binary", "rubric"]),
+});
+
+export const JudgeVerdictSchema = z.object({
+  criterion: z.string(),
+  kind: z.enum(["required", "disqualifier"]),
+  met: z.boolean(),
+  reason: z.string(),
+});
+
+export const ScoringRawSchema = z.object({
+  outputLength: z.number(),
+  hitRate: z.number(),
+  judgeVerdicts: z.array(JudgeVerdictSchema).optional(),
 });
 
 export const EvalCaseSchema = z.object({
@@ -67,10 +88,7 @@ export const RunReportSchema = z.object({
       requiredMisses: z.array(z.string()),
       disqualifierHits: z.array(z.string()),
       confidence: z.enum(["high", "low"]),
-      raw: z.object({
-        outputLength: z.number(),
-        hitRate: z.number(),
-      }),
+      raw: ScoringRawSchema,
     })
   ),
 });
@@ -79,6 +97,59 @@ export const RunReportSchema = z.object({
 
 export type EvalCase = z.infer<typeof EvalCaseSchema>;
 export type Rubric = z.infer<typeof RubricSchema>;
+export type RubricCriterionItem = z.infer<typeof RubricCriterionItemSchema>;
+export type JudgeVerdict = z.infer<typeof JudgeVerdictSchema>;
+
+export interface RubricCriterion {
+  text: string;
+  type: "literal" | "conceptual";
+}
+
+/**
+ * Infer routing for a bare required criterion.
+ *
+ * "literal" is narrow and earned — only genuine code/API tokens:
+ * symbols (: _ * / .) or internal camelCase/PascalCase.
+ * Everything else (plain words, hyphenated prose like "read-only") is
+ * "conceptual". Prefer conceptual when ambiguous: the judge subsumes
+ * substring matching, so over-routing costs a small judge call, while
+ * under-routing to literal causes false-fails on paraphrase.
+ * Explicit { text, type } tags always override this heuristic.
+ */
+export function inferRequiredType(text: string): "literal" | "conceptual" {
+  if (/[:_*/.]/.test(text)) return "literal";
+  // camelCase / PascalCase: lowercase letter followed by uppercase (e.g. PutObject).
+  if (/[a-z][A-Z]/.test(text)) return "literal";
+  return "conceptual";
+}
+
+function criterionText(entry: RubricCriterionItem): string {
+  return typeof entry === "string" ? entry : entry.text;
+}
+
+/**
+ * Normalize rubric entries to internal form. Bare strings use the whitespace
+ * heuristic for required criteria; explicit type wins when provided.
+ */
+export function normalizeRubric(rubric: Rubric): {
+  required: RubricCriterion[];
+  disqualifiers: string[];
+  scoring: Rubric["scoring"];
+} {
+  const required = rubric.required.map((entry) => {
+    if (typeof entry === "string") {
+      return { text: entry, type: inferRequiredType(entry) };
+    }
+    return {
+      text: entry.text,
+      type: entry.type ?? inferRequiredType(entry.text),
+    };
+  });
+
+  const disqualifiers = rubric.disqualifiers.map(criterionText);
+
+  return { required, disqualifiers, scoring: rubric.scoring };
+}
 
 export type Score = "pass" | "partial" | "fail";
 
@@ -108,7 +179,8 @@ export interface ScoringResult {
   confidence: "high" | "low";
   raw: {
     outputLength: number;
-    hitRate: number;           // 0.0–1.0
+    hitRate: number;
+    judgeVerdicts?: JudgeVerdict[];
   };
 }
 
@@ -124,6 +196,7 @@ export interface EvalResult extends ModelOutput {
   raw: {
     outputLength: number;
     hitRate: number;
+    judgeVerdicts?: JudgeVerdict[];
   };
 }
 
@@ -166,6 +239,6 @@ export interface CompletionResult {
 
 /** Every model provider implements this. The runner treats them uniformly. */
 export interface ModelAdapter {
-  name: string; // the model id, e.g. "claude-sonnet-4-5"
+  name: string; // the model id, e.g. "claude-sonnet-5"
   complete(prompt: string): Promise<CompletionResult>;
 }
