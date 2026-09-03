@@ -108,7 +108,11 @@ export interface RubricCriterion {
 /**
  * Infer routing for a bare required criterion.
  *
- * "literal" is narrow and earned — only genuine code/API tokens:
+ * Whitespace-first: any criterion containing whitespace is always "conceptual"
+ * (e.g. "NotAction allows everything except"), even if it embeds code-shaped
+ * words — otherwise multi-word prose is false-failed by literal substring match.
+ *
+ * "literal" is narrow and earned — only single, whitespace-free code/API tokens:
  * symbols (: _ * / .) or internal camelCase/PascalCase.
  * Everything else (plain words, hyphenated prose like "read-only") is
  * "conceptual". Prefer conceptual when ambiguous: the judge subsumes
@@ -117,6 +121,7 @@ export interface RubricCriterion {
  * Explicit { text, type } tags always override this heuristic.
  */
 export function inferRequiredType(text: string): "literal" | "conceptual" {
+  if (/\s/.test(text)) return "conceptual";
   if (/[:_*/.]/.test(text)) return "literal";
   // camelCase / PascalCase: lowercase letter followed by uppercase (e.g. PutObject).
   if (/[a-z][A-Z]/.test(text)) return "literal";
@@ -225,6 +230,54 @@ export interface RunReport {
 }
 
 export type RunReport_Validated = z.infer<typeof RunReportSchema>;
+
+// ── Multi-run aggregation ─────────────────────────────────────────────────────
+
+export const StatRangeSchema = z.object({
+  mean: z.number(),
+  std: z.number(),
+  min: z.number(),
+  max: z.number(),
+});
+
+export const CaseStabilitySchema = z.object({
+  passes: z.number(),
+  partials: z.number(),
+  fails: z.number(),
+  runs: z.number(),
+  passFrequency: z.number(),
+});
+
+export const ModelAggregateSchema = z.object({
+  model: z.string(),
+  runs: z.number(),
+  passRate: StatRangeSchema,
+  avgQualityScore: StatRangeSchema,
+  totalCostUsd: z.number(),
+  costPerRunMean: z.number(),
+  perCase: z.record(CaseStabilitySchema),
+  failureModeCountsTotal: z.object({
+    silent: z.number(),
+    fluent_error: z.number(),
+    spec_drift: z.number(),
+    hallucination: z.number(),
+  }),
+});
+
+export const AggregateReportSchema = z.object({
+  runId: z.string(),
+  datasetName: z.string(),
+  timestamp: z.string(),
+  models: z.array(z.string()),
+  runs: z.number(),
+  aggregate: z.array(ModelAggregateSchema),
+  runReports: z.array(RunReportSchema),
+});
+
+export type StatRange = z.infer<typeof StatRangeSchema>;
+export type CaseStability = z.infer<typeof CaseStabilitySchema>;
+export type ModelAggregate = z.infer<typeof ModelAggregateSchema>;
+export type AggregateReport = z.infer<typeof AggregateReportSchema>;
 
 
 // ── Model Adapter Contract ────────────────────────────────────────────────────
